@@ -1,0 +1,101 @@
+module parallel.test (test)
+
+import parallel
+import root
+
+type Py => Int = "int"
+type Py => Str = "str"
+type Py => Real = "float"
+type Py => Bool = "bool"
+type Py => U64 = "int"
+type Py => Tuple2 a b = "tuple" a b
+type Py => List a = "list" a
+
+source Py from "parallel-test.py" ("testEqual", "testTrue", "printMsg", "printResult")
+testEqual :: Str -> a -> a -> (Int, Int) -> (Int, Int)
+testTrue :: Str -> Bool -> (Int, Int) -> (Int, Int)
+printMsg :: Str -> a -> a
+printResult :: (Int, Int) -> (Int, Int)
+
+testGroup :: Str -> ((Int,Int) -> (Int,Int)) -> (Int,Int) -> (Int,Int)
+testGroup msg tests = tests . printMsg msg
+
+passed :: (Int, Int) -> Bool
+passed t = 0 == (.0 t)
+
+-- Inputs sized around the worker count: empty, one, fewer than a plausible
+-- core count, and enough to span several work units under every schedule.
+small :: [Int]
+small = [7]
+
+mid :: [Int]
+mid = range 0 5
+
+big :: [Int]
+big = range 0 200
+
+double :: Int -> Int
+double x = x * 2
+
+isEven :: Int -> Bool
+isEven x = x % 2 == 0
+
+twice :: Int -> [Int]
+twice x = [x, x]
+
+evenOpts :: ParOpts
+evenOpts = .(.chunking = EvenChunks) defaultParOpts
+
+fixedOpts :: ParOpts
+fixedOpts = .(.chunking = FixedChunks, .chunkSize = 7) defaultParOpts
+
+oneWorker :: ParOpts
+oneWorker = .(.workers = 1) defaultParOpts
+
+manyWorkers :: ParOpts
+manyWorkers = .(.workers = 8) defaultParOpts
+
+-- A parallel result must equal the sequential one for the same input. That is
+-- the whole contract: parallelism is an implementation choice, not a change of
+-- meaning.
+equivalence :: (Int, Int) -> (Int, Int)
+equivalence
+  = testEqual "pmap [] == map []" (pmap double []) (map double [])
+  . testEqual "pmap small" (pmap double small) (map double small)
+  . testEqual "pmap mid" (pmap double mid) (map double mid)
+  . testEqual "pmap big" (pmap double big) (map double big)
+  . testEqual "pfilter big" (pfilter isEven big) (filter isEven big)
+  . testEqual "pfilter none" (pfilter isEven []) (filter isEven [])
+  . testEqual "pconcatMap mid" (pconcatMap twice mid) (concatMap twice mid)
+  . testEqual "pconcatMap []" (pconcatMap twice []) (concatMap twice [])
+
+-- The answer must not depend on how the work was divided. A schedule that
+-- changes the result is a schedule that has lost an element or reordered one.
+schedules :: (Int, Int) -> (Int, Int)
+schedules
+  = testEqual "even == sequential" (pmapWith evenOpts double big) (map double big)
+  . testEqual "fixed == sequential" (pmapWith fixedOpts double big) (map double big)
+  . testEqual "one worker == sequential" (pmapWith oneWorker double big) (map double big)
+  . testEqual "many workers == sequential" (pmapWith manyWorkers double big) (map double big)
+  . testEqual "even filter" (pfilterWith evenOpts isEven big) (filter isEven big)
+  . testEqual "fixed concatMap" (pconcatMapWith fixedOpts twice mid) (concatMap twice mid)
+
+-- Worker count must not change a floating-point sum, which it would if the
+-- reduce were a tree over a non-associative operator.
+reductions :: (Int, Int) -> (Int, Int)
+reductions
+  = testEqual "pfoldMap == fold" (pfoldMap show mid) (fold (\acc x -> acc <> show x) "" mid)
+  . testEqual "pfoldMap 1 vs 8 workers"
+      (pfoldMapWith oneWorker show big)
+      (pfoldMapWith manyWorkers show big)
+
+runTests :: (Int, Int) -> Bool
+runTests
+  = passed
+  . printResult
+  . testGroup "Equivalence with the sequential form" equivalence
+  . testGroup "Schedules agree" schedules
+  . testGroup "Reductions are order-stable" reductions
+
+test :: Bool
+test = runTests (0, 0)

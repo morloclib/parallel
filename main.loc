@@ -1,0 +1,200 @@
+--' Parallel evaluation over lists, streams, and stream files.
+--'
+--' Every function here is a drop-in for a sequential counterpart and returns
+--' the same answer: results are in input order and do not depend on the worker
+--' count. Parallelism is an implementation choice, not a change of meaning.
+--'
+--' The compiler realizes each function in the pool that already runs the
+--' function being mapped, so the common case is an in-pool call. A mapped
+--' function realized elsewhere still works; it simply pays a pool crossing per
+--' work unit, which is what `chunkSize` is for.
+module parallel (*)
+
+import root
+
+
+-- Scheduling
+--------------
+
+--' How a body of work is divided among workers.
+--'
+--' The default, `ShrinkingChunks`, hands out large units while work is
+--' plentiful and single elements at the tail. It is the safe choice under
+--' unknown cost: a run of elements that are all cheap loses almost nothing to
+--' coordination, and one expensive element cannot strand a worker holding a
+--' large unaccounted block.
+--'
+--' `EvenChunks` splits into one contiguous block per worker and coordinates
+--' not at all. It is the fastest schedule when element costs are uniform and
+--' the worst when they are not: the run takes as long as the unluckiest block.
+--'
+--' `FixedChunks` takes units of exactly `chunkSize` elements. Reach for it
+--' when the per-element cost is known and small enough that the unit size
+--' should be set by hand.
+data ParChunking = EvenChunks | ShrinkingChunks | FixedChunks
+
+--' Whether results reach a sink in the order they were read or the order they
+--' finished.
+--'
+--' Only the streaming functions consult this. The list functions always return
+--' input order, because a list result is a value and its order is part of the
+--' answer rather than a scheduling artifact.
+--'
+--' `InputOrder` costs a reorder buffer: a slow element holds back everything
+--' that finished after it, bounded by `inflight`. `ArrivalOrder` has no buffer
+--' and no bound, and is correct whenever the consumer does not care.
+data ParOrder = InputOrder | ArrivalOrder
+
+--' Tuning for the parallel combinators. `defaultParOpts` is the starting
+--' point; override fields from it rather than building one from scratch, so a
+--' later field does not silently change your meaning.
+record ParOpts where
+  --' Concurrent workers. `Null` selects the pool's core count.
+  workers :: ?Int
+
+  --' Elements per work unit. Read only under `FixedChunks`.
+  chunkSize :: ?Int
+
+  --' How work is divided.
+  chunking :: ParChunking
+
+  --' Result order where results reach a sink. Ignored by the list functions.
+  order :: ParOrder
+
+  --' Maximum work units in flight. Bounds the reorder buffer under
+  --' `InputOrder`, and bounds memory when the source is unbounded. `Null`
+  --' selects twice the worker count.
+  inflight :: ?Int
+
+--' Sensible defaults: every core, a shrinking schedule, input order.
+defaultParOpts :: ParOpts
+defaultParOpts =
+  { workers = Null
+  , chunkSize = Null
+  , chunking = ShrinkingChunks
+  , order = InputOrder
+  , inflight = Null
+  }
+
+
+-- Lists
+---------
+
+--' Apply a function to every element, in parallel. Equivalent to `map`.
+pmapWith :: ParOpts -> (a -> b) -> [a] -> [b]
+
+--' Keep the elements satisfying a predicate, testing in parallel.
+--' Equivalent to `filter`.
+pfilterWith :: ParOpts -> (a -> Bool) -> [a] -> [a]
+
+--' Apply a list-valued function to every element and concatenate the results,
+--' in parallel. Equivalent to `concatMap`.
+pconcatMapWith :: ParOpts -> (a -> [b]) -> [a] -> [b]
+
+pmap :: (a -> b) -> [a] -> [b]
+pmap f = pmapWith defaultParOpts f
+
+pfilter :: (a -> Bool) -> [a] -> [a]
+pfilter p = pfilterWith defaultParOpts p
+
+pconcatMap :: (a -> [b]) -> [a] -> [b]
+pconcatMap f = pconcatMapWith defaultParOpts f
+
+--' Map each element into a monoid and combine the results.
+--'
+--' The map runs in parallel; the combine is a sequential left fold. That is
+--' deliberate. The list is already in memory, so the fold is cheap next to the
+--' mapping, and a fixed fold order makes the answer identical on four cores
+--' and on sixty-four -- which a tree reduction over `Real` would not be, since
+--' floating-point addition is not associative.
+pfoldMapWith :: Monoid m => ParOpts -> (a -> m) -> [a] -> m
+pfoldMapWith opts f xs = fold (<>) mempty (pmapWith opts f xs)
+
+pfoldMap :: Monoid m => (a -> m) -> [a] -> m
+pfoldMap f = pfoldMapWith defaultParOpts f
+
+--' Apply many functions to one value, in parallel.
+papply :: [a -> b] -> a -> [b]
+papply fs x = pmap (\f -> f x) fs
+
+
+-- Streams
+-----------
+
+--' The parallel stream stage: pull batches from a source, apply a list-valued
+--' function to each element in parallel, push results to a sink.
+--'
+--' The source is an action returning the next batch, and an empty list at the
+--' end -- which is exactly a partially applied `@next`. Taking an action rather
+--' than a handle keeps the stage source-agnostic (a file, standard input,
+--' anything that can produce batches) and makes it a producer in the shape
+--' `@collect` consumes:
+--'
+--'     \@collect (psmap f (@next fi))
+--'
+--' A read failure is fatal here rather than returned. The producer shape
+--' `@collect` requires has no room for a `Try`, and a stream that cannot be
+--' read has nothing partial to hand back. Use `psfoldWith` when you want the
+--' failure as a value.
+psconcatMapWith
+  :: ParOpts
+  -> (a -> [b])
+  -> <IO> (Try Str [a])
+  -> ([b] -> <IO> ())
+  -> <IO> ()
+
+--' Reduce a stream as results arrive, without materializing it.
+--'
+--' `combine` must be associative and `identity` must be its unit. Partial
+--' results are combined in chunk order, so the answer is reproducible under
+--' `EvenChunks` and `FixedChunks`. It is NOT reproducible under
+--' `ShrinkingChunks`, where chunk boundaries depend on timing -- which matters
+--' for `Real`, whose addition is not associative.
+psfoldWith
+  :: ParOpts
+  -> (b -> b -> b)
+  -> b
+  -> (a -> b)
+  -> <IO> (Try Str [a])
+  -> <IO> (Try Str b)
+
+psmapWith :: ParOpts -> (a -> b) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psmapWith opts f = psconcatMapWith opts (\x -> [f x])
+
+psfilterWith :: ParOpts -> (a -> Bool) -> <IO> (Try Str [a]) -> ([a] -> <IO> ()) -> <IO> ()
+psfilterWith opts p = psconcatMapWith opts (\x -> ? p x = [x] : [])
+
+psmap :: (a -> b) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psmap f = psmapWith defaultParOpts f
+
+psfilter :: (a -> Bool) -> <IO> (Try Str [a]) -> ([a] -> <IO> ()) -> <IO> ()
+psfilter p = psfilterWith defaultParOpts p
+
+psconcatMap :: (a -> [b]) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psconcatMap f = psconcatMapWith defaultParOpts f
+
+psfoldMapWith :: Monoid m => ParOpts -> (a -> m) -> <IO> (Try Str [a]) -> <IO> (Try Str m)
+psfoldMapWith opts f = psfoldWith opts (<>) mempty f
+
+psfoldMap :: Monoid m => (a -> m) -> <IO> (Try Str [a]) -> <IO> (Try Str m)
+psfoldMap f = psfoldMapWith defaultParOpts f
+
+
+-- Stream files
+----------------
+
+--' Map a stream file into another stream file, in parallel.
+--'
+--' This is the one place where the partition can be both exact and cheap.
+--' `@streamLayout` reports each sub-packet's element offset, element count and
+--' uncompressed size without decompressing anything, so workers can take
+--' ranges of equal BYTE weight rather than equal element count. Each worker
+--' writes its own temporary file and `@concat` merges them in range order, so
+--' the output is in input order with no reorder buffer in memory.
+--'
+--' Because the ranges are planned before any worker starts, `ShrinkingChunks`
+--' has nothing to shrink here and behaves as `EvenChunks`.
+pfmapToWith :: ParOpts -> (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
+
+pfmapTo :: (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
+pfmapTo f file dest = pfmapToWith defaultParOpts f file dest
