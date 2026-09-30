@@ -1,0 +1,4 @@
+labeled-groups:
+  seq: { benchmark: true }
+  par: { benchmark: true }
+

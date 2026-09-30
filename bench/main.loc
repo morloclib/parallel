@@ -1,0 +1,181 @@
+--' Benchmark workloads for the parallel module, shared by every language.
+--'
+--' Each language directory builds `bench.loc`, which imports this module and
+--' sources the cost functions below from that language, so a workload measures
+--' the implementation under test rather than the language's arithmetic.
+--' `bench/run.sh` drives the commands and `bench/compare.py` lines the results
+--' up across languages.
+--'
+--' An element carries its own cost (an iteration count for `spin`) rather than
+--' the cost being bound into a closure, because some backends cannot run a
+--' closure that captures a value on another thread.
+--'
+--' Every command returns a small checksum so the work cannot be skipped and
+--' runs can be compared for agreement. The timed calls carry labels declared in
+--' `main.yaml`; the nexus reports one row per label at exit.
+module parallel.bench (*)
+
+import parallel
+import root
+
+
+-- Costs, implemented per language
+-----------------------------------
+
+--' Burn `n` iterations of an integer recurrence; the result is in [0, 1000).
+spin :: Int -> Int
+
+--' `spin`, as a predicate keeping about half the elements.
+spinKeep :: Int -> Bool
+
+--' `spin`, as a list of length 0 to 3.
+spinList :: Int -> [Int]
+
+--' A string of `n` bytes.
+makeStr :: Int -> Str
+
+--' A cheap function of a string: its length modulo 1000.
+strCost :: Str -> Int
+
+
+-- Inputs and options
+----------------------
+
+--' Per-element iteration counts. Shapes:
+--'   0 uniform: every element costs `base`
+--'   1 ramp: cost rises linearly from 0 to 2 * base across the input
+--'   2 front-loaded: the first 1% cost 100 * base, the rest `base`
+--'   3 scattered: 1 element in 100, spread through the input, costs 100 * base
+costs :: Int -> Int -> Int -> [Int]
+costs shape n base = map (costAt shape n base) (range 0 n)
+
+costAt :: Int -> Int -> Int -> Int -> Int
+costAt shape n base i
+  = ? shape == 1 = (2 * base * i) // n
+  : ? shape == 2 = (? i < n // 100 = 100 * base : base)
+  : ? shape == 3 = (? i % 100 == 37 = 100 * base : base)
+  : base
+
+--' Options from command-line codes. `chunking`: 0 even, 1 shrinking, 2 fixed.
+--' `order`: 0 input, 1 arrival. A zero `chunk` or `inflight` keeps the default.
+opts :: Int -> Int -> Int -> ParOpts
+opts workers chunking chunk = optsFull workers chunking chunk 0 0
+
+optsFull :: Int -> Int -> Int -> Int -> Int -> ParOpts
+optsFull workers chunking chunk order inflight =
+  .( .workers = workers
+   , .chunking = chunkingOf chunking
+   , .chunkSize = chunk
+   , .order = orderOf order
+   , .inflight = inflight
+   ) defaultParOpts
+
+chunkingOf :: Int -> ParChunking
+chunkingOf c = ? c == 0 = EvenChunks : ? c == 1 = ShrinkingChunks : FixedChunks
+
+orderOf :: Int -> ParOrder
+orderOf o = ? o == 1 = ArrivalOrder : InputOrder
+
+checksum :: [Int] -> Int
+checksum xs = fold (\acc x -> (acc + x) % 1000003) 0 xs
+
+keptChecksum :: [Int] -> Int
+keptChecksum xs = checksum (map (\x -> x % 1000) xs)
+
+
+-- Lists
+---------
+
+--' Sequential baseline: `map spin`.
+seqMap :: Int -> Int -> Int -> Int
+seqMap shape n base = checksum (seq@map spin (costs shape n base))
+
+--' `pmapWith spin` under options (workers, chunking, chunk size).
+parMap :: Int -> Int -> Int -> Int -> Int -> Int -> Int
+parMap workers chunking chunk shape n base =
+  checksum (par@pmapWith (opts workers chunking chunk) spin (costs shape n base))
+
+seqFilter :: Int -> Int -> Int -> Int
+seqFilter shape n base = keptChecksum (seq@filter spinKeep (costs shape n base))
+
+parFilter :: Int -> Int -> Int -> Int -> Int -> Int -> Int
+parFilter workers chunking chunk shape n base =
+  keptChecksum (par@pfilterWith (opts workers chunking chunk) spinKeep (costs shape n base))
+
+seqConcatMap :: Int -> Int -> Int -> Int
+seqConcatMap shape n base = checksum (seq@concatMap spinList (costs shape n base))
+
+parConcatMap :: Int -> Int -> Int -> Int -> Int -> Int -> Int
+parConcatMap workers chunking chunk shape n base =
+  checksum (par@pconcatMapWith (opts workers chunking chunk) spinList (costs shape n base))
+
+--' Large elements, cheap work: `n` strings of `bytes` bytes each.
+seqPayload :: Int -> Int -> Int
+seqPayload n bytes = checksum (seq@map strCost (replicate n (makeStr bytes)))
+
+parPayload :: Int -> Int -> Int -> Int -> Int
+parPayload workers chunking n bytes =
+  checksum (par@pmapWith (opts workers chunking 0) strCost (replicate n (makeStr bytes)))
+
+
+-- Streams
+-----------
+
+writeTo :: OStream Int -> [Int] -> <IO> ()
+writeTo o xs = do
+  @write 0 o xs
+  ()
+
+writeCostBatches :: OStream Int -> Int -> Int -> Int -> <IO> ()
+writeCostBatches o k size base = ? k <= 0 = do
+    ()
+  : do
+    @write 0 o (replicate size base)
+    @flush o
+    writeCostBatches o (k - 1) size base
+
+--' Write a stream file of `batches` sub-packets of `size` elements, each an
+--' iteration count of `base`.
+streamMake :: Str -> Int -> Int -> Int -> <IO> Int
+streamMake path batches size base = do
+  Ok o <- @open path :: <IO> (Try Str (OStream Int))
+  writeCostBatches o batches size base
+  @close o
+  batches * size
+
+--' The native stage mapping `spin` from `src` to `dst`, under options
+--' (workers, chunking, chunk size, order, inflight).
+streamNative :: Int -> Int -> Int -> Int -> Int -> Str -> Str -> <IO> Int
+streamNative workers chunking chunk order inflight src dst = do
+  Ok s <- @open src :: <IO> (Try Str (IStream Int))
+  Ok o <- @open dst :: <IO> (Try Str (OStream Int))
+  psmapWith (optsFull workers chunking chunk order inflight) spin (@next s) (writeTo o)
+  @close o
+  @close s
+  0
+
+--' The morloc stage over the same files. `workers = 1` is the sequential
+--' baseline: one batch at a time, each mapped inline.
+streamPure :: Int -> Int -> Int -> Str -> Str -> <IO> Int
+streamPure workers chunking chunk src dst = do
+  Ok s <- @open src :: <IO> (Try Str (IStream Int))
+  Ok o <- @open dst :: <IO> (Try Str (OStream Int))
+  psmapWithPure (opts workers chunking chunk) spin (@next s) (writeTo o)
+  @close o
+  @close s
+  0
+
+--' Fold stages over a file: `spin` in parallel, a sum in input order.
+streamFoldNative :: Int -> Int -> Int -> Str -> <IO> Int
+streamFoldNative workers chunking chunk src = do
+  Ok s <- @open src :: <IO> (Try Str (IStream Int))
+  r <- psfoldWith (opts workers chunking chunk) (+) 0 spin (@next s)
+  @close s
+  unwrap r
+
+streamFoldPure :: Int -> Int -> Int -> Str -> <IO> Int
+streamFoldPure workers chunking chunk src = do
+  Ok s <- @open src :: <IO> (Try Str (IStream Int))
+  r <- psfoldWithPure (opts workers chunking chunk) (+) 0 spin (@next s)
+  @close s
+  unwrap r

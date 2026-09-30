@@ -1,30 +1,17 @@
-module parallel.test (test)
+module parallel.test (test, testNoClosures, synthOpen, synthNext, sinkOpen, sinkPut, sinkBatches)
 
 import parallel
 import root
+import text (contains)
+import unittest
 
-type Py => Int = "int"
-type Py => Str = "str"
-type Py => Real = "float"
-type Py => Bool = "bool"
-type Py => U64 = "int"
-type Py => Tuple2 a b = "tuple" a b
-type Py => List a = "list" a
 
-source Py from "parallel-test.py" ("testEqual", "testTrue", "printMsg", "printResult")
-testEqual :: Str -> a -> a -> (Int, Int) -> (Int, Int)
-testTrue :: Str -> Bool -> (Int, Int) -> (Int, Int)
-printMsg :: Str -> a -> a
-printResult :: (Int, Int) -> (Int, Int)
-
-testGroup :: Str -> ((Int,Int) -> (Int,Int)) -> (Int,Int) -> (Int,Int)
-testGroup msg tests = tests . printMsg msg
-
-passed :: (Int, Int) -> Bool
-passed t = 0 == (.0 t)
+-- Inputs and options
+----------------------
 
 -- Inputs sized around the worker count: empty, one, fewer than a plausible
--- core count, and enough to span several work units under every schedule.
+-- core count, enough to span several work units under every schedule, and
+-- enough for the shrinking schedule to run several rounds.
 small :: [Int]
 small = [7]
 
@@ -33,6 +20,15 @@ mid = range 0 5
 
 big :: [Int]
 big = range 0 200
+
+huge :: [Int]
+huge = range 0 10000
+
+none :: [Int]
+none = []
+
+noFunctions :: [Int -> Int]
+noFunctions = []
 
 double :: Int -> Int
 double x = x * 2
@@ -43,59 +39,552 @@ isEven x = x % 2 == 0
 twice :: Int -> [Int]
 twice x = [x, x]
 
+-- A list whose length depends on the element, including empty results.
+upTo :: Int -> [Int]
+upTo x = range 0 (x % 4)
+
 evenOpts :: ParOpts
 evenOpts = .(.chunking = EvenChunks) defaultParOpts
 
 fixedOpts :: ParOpts
 fixedOpts = .(.chunking = FixedChunks, .chunkSize = 7) defaultParOpts
 
+fixedDefaultSize :: ParOpts
+fixedDefaultSize = .(.chunking = FixedChunks) defaultParOpts
+
+fixedOversized :: ParOpts
+fixedOversized = .(.chunking = FixedChunks, .chunkSize = 100000) defaultParOpts
+
 oneWorker :: ParOpts
 oneWorker = .(.workers = 1) defaultParOpts
+
+threeWorkers :: ParOpts
+threeWorkers = .(.workers = 3) defaultParOpts
 
 manyWorkers :: ParOpts
 manyWorkers = .(.workers = 8) defaultParOpts
 
+tooManyWorkers :: ParOpts
+tooManyWorkers = .(.workers = 64) defaultParOpts
+
+-- Zero and negative counts select the default, as `Null` does.
+zeroWorkers :: ParOpts
+zeroWorkers = .(.workers = 0) defaultParOpts
+
+negativeWorkers :: ParOpts
+negativeWorkers = .(.workers = -2) defaultParOpts
+
+singleSpan :: ParOpts
+singleSpan = .(.workers = 1, .chunking = EvenChunks) defaultParOpts
+
+arrival :: ParOpts
+arrival = .(.order = ArrivalOrder) defaultParOpts
+
+inflightOne :: ParOpts
+inflightOne = .(.inflight = 1, .workers = 4) defaultParOpts
+
+inflightTwo :: ParOpts
+inflightTwo = .(.inflight = 2, .workers = 4) defaultParOpts
+
+inflightMany :: ParOpts
+inflightMany = .(.inflight = 1000, .workers = 4) defaultParOpts
+
+-- Many workers, single-element units: the most reordering a stage can do.
+arrivalFine :: ParOpts
+arrivalFine = .(.order = ArrivalOrder, .workers = 8, .chunking = FixedChunks, .chunkSize = 1) defaultParOpts
+
+
+-- Lists
+---------
+
 -- A parallel result must equal the sequential one for the same input. That is
 -- the whole contract: parallelism is an implementation choice, not a change of
 -- meaning.
-equivalence :: (Int, Int) -> (Int, Int)
+equivalence :: Test
 equivalence
   = testEqual "pmap [] == map []" (pmap double []) (map double [])
   . testEqual "pmap small" (pmap double small) (map double small)
   . testEqual "pmap mid" (pmap double mid) (map double mid)
   . testEqual "pmap big" (pmap double big) (map double big)
+  . testEqual "pmap huge" (pmap double huge) (map double huge)
   . testEqual "pfilter big" (pfilter isEven big) (filter isEven big)
+  . testEqual "pfilter huge" (pfilter isEven huge) (filter isEven huge)
   . testEqual "pfilter none" (pfilter isEven []) (filter isEven [])
   . testEqual "pconcatMap mid" (pconcatMap twice mid) (concatMap twice mid)
   . testEqual "pconcatMap []" (pconcatMap twice []) (concatMap twice [])
+  . testEqual "pconcatMap ragged" (pconcatMap upTo big) (concatMap upTo big)
 
 -- The answer must not depend on how the work was divided. A schedule that
 -- changes the result is a schedule that has lost an element or reordered one.
-schedules :: (Int, Int) -> (Int, Int)
+schedules :: Test
 schedules
   = testEqual "even == sequential" (pmapWith evenOpts double big) (map double big)
+  . testEqual "even, huge" (pmapWith evenOpts double huge) (map double huge)
   . testEqual "fixed == sequential" (pmapWith fixedOpts double big) (map double big)
+  . testEqual "fixed, no chunk size" (pmapWith fixedDefaultSize double big) (map double big)
+  . testEqual "fixed, chunk larger than input" (pmapWith fixedOversized double big) (map double big)
   . testEqual "one worker == sequential" (pmapWith oneWorker double big) (map double big)
+  . testEqual "three workers" (pmapWith threeWorkers double big) (map double big)
   . testEqual "many workers == sequential" (pmapWith manyWorkers double big) (map double big)
+  . testEqual "more workers than elements" (pmapWith tooManyWorkers double mid) (map double mid)
+  . testEqual "zero workers means default" (pmapWith zeroWorkers double big) (map double big)
+  . testEqual "negative workers means default" (pmapWith negativeWorkers double big) (map double big)
   . testEqual "even filter" (pfilterWith evenOpts isEven big) (filter isEven big)
+  . testEqual "fixed filter" (pfilterWith fixedOpts isEven big) (filter isEven big)
   . testEqual "fixed concatMap" (pconcatMapWith fixedOpts twice mid) (concatMap twice mid)
+  . testEqual "even concatMap ragged" (pconcatMapWith evenOpts upTo big) (concatMap upTo big)
+  . testEqual "many workers concatMap ragged" (pconcatMapWith tooManyWorkers upTo huge) (concatMap upTo huge)
 
--- Worker count must not change a floating-point sum, which it would if the
--- reduce were a tree over a non-associative operator.
-reductions :: (Int, Int) -> (Int, Int)
+-- The fold order is fixed, so the answer is the sequential fold's whatever
+-- the worker count.
+reductions :: Test
 reductions
   = testEqual "pfoldMap == fold" (pfoldMap show mid) (fold (\acc x -> acc <> show x) "" mid)
   . testEqual "pfoldMap 1 vs 8 workers"
       (pfoldMapWith oneWorker show big)
       (pfoldMapWith manyWorkers show big)
+  . testEqual "pfoldMap []" (pfoldMap show none) ""
 
-runTests :: (Int, Int) -> Bool
-runTests
-  = passed
-  . printResult
-  . testGroup "Equivalence with the sequential form" equivalence
-  . testGroup "Schedules agree" schedules
-  . testGroup "Reductions are order-stable" reductions
+-- A failure inside a worker must reach the caller with its message intact,
+-- whether the input spans one work unit or many.
+failAt :: Int -> Int
+failAt x = ? x == 150 = @throw "boom-at-150" : x
 
-test :: Bool
-test = runTests (0, 0)
+errContains :: Str -> Try Str a -> Bool
+errContains msg t = match t
+  | (Err e) = contains msg e
+  | (Ok _) = False
+
+failures :: Test
+failures
+  = testTrue "pmap: many spans keep the message"
+      (errContains "boom-at-150" (@try (pmapWith manyWorkers failAt big)))
+  . testTrue "pmap: one span keeps the message"
+      (errContains "boom-at-150" (@try (pmapWith singleSpan failAt big)))
+  . testTrue "pfilter keeps the message"
+      (errContains "boom-at-150" (@try (pfilterWith manyWorkers (\x -> failAt x > 0) big)))
+  . testTrue "pconcatMap keeps the message"
+      (errContains "boom-at-150" (@try (pconcatMapWith evenOpts (\x -> [failAt x]) big)))
+
+
+-- Closures (not Rust)
+-----------------------
+
+-- A mapped function may itself call a parallel combinator.
+rowSum :: [Int] -> Int
+rowSum row = sum (pmap double row)
+
+rows :: [[Int]]
+rows = [range 0 10, range 10 30, [], range 30 35]
+
+addTo :: Int -> [Int] -> [Int]
+addTo k xs = pmap (\x -> x + k) xs
+
+closures :: Test
+closures
+  = testEqual "nested pmap" (pmapWith manyWorkers rowSum rows) (map rowSum rows)
+  . testEqual "nested pmap, one outer worker" (pmapWith oneWorker rowSum rows) (map rowSum rows)
+  . testEqual "mapped function captures a value" (addTo 5 big) (map (\x -> x + 5) big)
+  . testEqual "papply" (papply [double, (\x -> x + 1), (\x -> x * x)] 7) [14, 8, 49]
+  . testEqual "papply []" (papply noFunctions 7) none
+
+
+-- Streams
+-----------
+
+-- A synthetic source and sink, implemented per language in
+-- parallel-<lang>/testlib.*, so every backend can test its stream stages end
+-- to end. A source is a list of batch sizes whose elements count up from 0
+-- across batches; a negative size is a read failure at that point. A sink
+-- records every batch it receives.
+synthOpen :: [Int] -> <IO> Int
+synthNext :: Int -> <IO> (Bool, [Int])
+sinkOpen :: <IO> Int
+sinkPut :: Int -> [Int] -> <IO> ()
+sinkBatches :: Int -> <IO> [[Int]]
+
+synthPull :: Int -> <IO> (Try Str [Int])
+synthPull k = do
+  r <- synthNext k
+  ? .0 r = Ok (.1 r) : Err "synthetic read failure"
+
+-- The elements a source of these sizes yields.
+elements :: [Int] -> [Int]
+elements sizes = range 0 (sum sizes)
+
+-- One runner per mapped function rather than one taking the function as an
+-- argument: Rust can only run a function on another thread when it is named
+-- at the stage call, not passed in as a value (see `listGroups`).
+runConcat :: ParOpts -> [Int] -> <IO> [[Int]]
+runConcat opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psconcatMapWith opts twice (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runConcatUpTo :: ParOpts -> [Int] -> <IO> [[Int]]
+runConcatUpTo opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psconcatMapWith opts upTo (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runConcatPure :: ParOpts -> [Int] -> <IO> [[Int]]
+runConcatPure opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psconcatMapWithPure opts twice (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runConcatUpToPure :: ParOpts -> [Int] -> <IO> [[Int]]
+runConcatUpToPure opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psconcatMapWithPure opts upTo (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runMap :: ParOpts -> [Int] -> <IO> [[Int]]
+runMap opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psmapWith opts double (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runMapFail :: ParOpts -> [Int] -> <IO> [[Int]]
+runMapFail opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psmapWith opts failAt (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runFilter :: ParOpts -> [Int] -> <IO> [[Int]]
+runFilter opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psfilterWith opts isEven (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runFilterPure :: ParOpts -> [Int] -> <IO> [[Int]]
+runFilterPure opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  psfilterWithPure opts isEven (synthPull k) (sinkPut o)
+  sinkBatches o
+
+runSum :: ParOpts -> [Int] -> <IO> (Try Str Int)
+runSum opts sizes = do
+  k <- synthOpen sizes
+  psfoldWith opts (+) 0 double (synthPull k)
+
+runSumFail :: ParOpts -> [Int] -> <IO> (Try Str Int)
+runSumFail opts sizes = do
+  k <- synthOpen sizes
+  psfoldWith opts (+) 0 failAt (synthPull k)
+
+runSumPure :: ParOpts -> [Int] -> <IO> (Try Str Int)
+runSumPure opts sizes = do
+  k <- synthOpen sizes
+  psfoldWithPure opts (+) 0 double (synthPull k)
+
+runSumFailPure :: ParOpts -> [Int] -> <IO> (Try Str Int)
+runSumFailPure opts sizes = do
+  k <- synthOpen sizes
+  psfoldWithPure opts (+) 0 failAt (synthPull k)
+
+runShow :: ParOpts -> [Int] -> <IO> (Try Str Str)
+runShow opts sizes = do
+  k <- synthOpen sizes
+  psfoldMapWith opts show (synthPull k)
+
+runShowPure :: ParOpts -> [Int] -> <IO> (Try Str Str)
+runShowPure opts sizes = do
+  k <- synthOpen sizes
+  psfoldMapWithPure opts show (synthPull k)
+
+-- Terms whose sum depends on the order they are added in: 1e16 + 1 is 1e16,
+-- so a different grouping keeps or loses the ones.
+bigSmall :: Int -> Real
+bigSmall i = ? i % 4 == 0 = 1.0e16 : ? i % 4 == 2 = -1.0e16 : 1.0
+
+runRealSum :: ParOpts -> [Int] -> <IO> (Try Str Real)
+runRealSum opts sizes = do
+  k <- synthOpen sizes
+  psfoldWith opts (+) 0.0 bigSmall (synthPull k)
+
+runRealSumPure :: ParOpts -> [Int] -> <IO> (Try Str Real)
+runRealSumPure opts sizes = do
+  k <- synthOpen sizes
+  psfoldWithPure opts (+) 0.0 bigSmall (synthPull k)
+
+seqRealSum :: [Int] -> Real
+seqRealSum sizes = fold (\acc i -> acc + bigSmall i) 0.0 (elements sizes)
+
+nonEmpty :: [[Int]] -> Bool
+nonEmpty bs = all (\b -> size b > 0) bs
+
+manyBatches :: [Int]
+manyBatches = replicate 60 7
+
+ragged :: [Int]
+ragged = [5, 1, 17, 3, 40, 2, 64, 1]
+
+largeBatches :: [Int]
+largeBatches = [3000, 2500, 4000]
+
+failingSource :: [Int]
+failingSource = [50, 50, -1, 50]
+
+-- Worker counts, chunking, `inflight` and the native or morloc form must not
+-- change what the sink receives in input order.
+streamOrder :: Results -> <IO> Results
+streamOrder s = do
+  a1 <- runConcat defaultParOpts ragged
+  a2 <- runConcat oneWorker ragged
+  a3 <- runConcat evenOpts largeBatches
+  a4 <- runConcatUpTo fixedOpts manyBatches
+  a5 <- runConcat inflightOne ragged
+  a6 <- runConcat inflightTwo manyBatches
+  a7 <- runConcat inflightMany manyBatches
+  a8 <- runConcat defaultParOpts []
+  a9 <- runConcat defaultParOpts [1]
+  b1 <- runConcatPure defaultParOpts ragged
+  b2 <- runConcatPure oneWorker ragged
+  b3 <- runConcatUpToPure fixedOpts manyBatches
+  b4 <- runConcatPure defaultParOpts []
+  c1 <- runMap manyWorkers largeBatches
+  c2 <- runFilter manyWorkers ragged
+  c3 <- runFilterPure manyWorkers ragged
+  ( testEqual "native, defaults" (concat a1) (concatMap twice (elements ragged))
+  . testEqual "native, one worker" (concat a2) (concatMap twice (elements ragged))
+  . testEqual "native, even chunks, large batches" (concat a3) (concatMap twice (elements largeBatches))
+  . testEqual "native, fixed chunks, ragged results" (concat a4) (concatMap upTo (elements manyBatches))
+  . testEqual "native, inflight 1" (concat a5) (concatMap twice (elements ragged))
+  . testEqual "native, inflight 2" (concat a6) (concatMap twice (elements manyBatches))
+  . testEqual "native, inflight 1000" (concat a7) (concatMap twice (elements manyBatches))
+  . testEqual "native, empty source" a8 []
+  . testEqual "native, one element" (concat a9) [0, 0]
+  . testTrue "native sink never sees an empty batch" (nonEmpty a4)
+  . testEqual "pure, defaults" (concat b1) (concatMap twice (elements ragged))
+  . testEqual "pure, one worker" (concat b2) (concatMap twice (elements ragged))
+  . testEqual "pure, fixed chunks, ragged results" (concat b3) (concatMap upTo (elements manyBatches))
+  . testEqual "pure, empty source" b4 []
+  . testTrue "pure sink never sees an empty batch" (nonEmpty b3)
+  . testEqual "psmapWith" (concat c1) (map double (elements largeBatches))
+  . testEqual "psfilterWith" (concat c2) (filter isEven (elements ragged))
+  . testEqual "psfilterWithPure" (concat c3) (filter isEven (elements ragged))
+  ) s
+
+-- Arrival order may reorder results and move batch boundaries, so only the
+-- multiset of elements is checked.
+streamArrival :: Results -> <IO> Results
+streamArrival s = do
+  a1 <- runConcat arrival ragged
+  a2 <- runConcatUpTo arrivalFine manyBatches
+  ( testSameElements "arrival, defaults" (concat a1) (concatMap twice (elements ragged))
+  . testSameElements "arrival, single-element units" (concat a2) (concatMap upTo (elements manyBatches))
+  . testTrue "arrival sink never sees an empty batch" (nonEmpty a2)
+  ) s
+
+-- A fold consumes results in input order, so its answer is the sequential
+-- fold's under every option, even for a combine that is not associative.
+streamFolds :: Results -> <IO> Results
+streamFolds s = do
+  a1 <- runSum defaultParOpts ragged
+  a2 <- runSum arrivalFine manyBatches
+  a3 <- runSum defaultParOpts []
+  b1 <- runSumPure defaultParOpts ragged
+  b2 <- runSumPure oneWorker []
+  c1 <- runShow arrivalFine ragged
+  c2 <- runShowPure fixedOpts ragged
+  r1 <- runRealSum defaultParOpts largeBatches
+  r2 <- runRealSum arrivalFine largeBatches
+  r3 <- runRealSum evenOpts largeBatches
+  r4 <- runRealSum oneWorker largeBatches
+  r5 <- runRealSumPure defaultParOpts largeBatches
+  r6 <- runRealSumPure fixedOpts largeBatches
+  ( testEqual "native sum" a1 (Ok (sum (map double (elements ragged))))
+  . testEqual "native sum, arrival order" a2 (Ok (sum (map double (elements manyBatches))))
+  . testEqual "native sum, empty source" a3 (Ok 0)
+  . testEqual "pure sum" b1 (Ok (sum (map double (elements ragged))))
+  . testEqual "pure sum, empty source" b2 (Ok 0)
+  . testEqual "native foldMap keeps input order" c1 (Ok (fold (\acc x -> acc <> show x) "" (elements ragged)))
+  . testEqual "pure foldMap keeps input order" c2 (Ok (fold (\acc x -> acc <> show x) "" (elements ragged)))
+  . testEqual "native real sum, defaults" r1 (Ok (seqRealSum largeBatches))
+  . testEqual "native real sum, arrival order" r2 (Ok (seqRealSum largeBatches))
+  . testEqual "native real sum, even chunks" r3 (Ok (seqRealSum largeBatches))
+  . testEqual "native real sum, one worker" r4 (Ok (seqRealSum largeBatches))
+  . testEqual "pure real sum, defaults" r5 (Ok (seqRealSum largeBatches))
+  . testEqual "pure real sum, fixed chunks" r6 (Ok (seqRealSum largeBatches))
+  ) s
+
+-- A read failure is an `Err` from a fold and fatal to a concatMap; a worker
+-- failure propagates from both, message intact.
+streamFailures :: Results -> <IO> Results
+streamFailures s = do
+  a1 <- runSum defaultParOpts failingSource
+  a2 <- runSumPure defaultParOpts failingSource
+  a3 <- @try (runConcat defaultParOpts failingSource)
+  a4 <- @try (runConcatPure defaultParOpts failingSource)
+  b1 <- @try (runMapFail manyWorkers largeBatches)
+  b2 <- @try (runMapFail inflightOne largeBatches)
+  b3 <- @try (runSumFail manyWorkers largeBatches)
+  b4 <- @try (runSumFailPure manyWorkers largeBatches)
+  ( testTrue "native fold returns the read failure" (errContains "synthetic read failure" a1)
+  . testTrue "pure fold returns the read failure" (errContains "synthetic read failure" a2)
+  . testTrue "native concatMap raises the read failure" (errContains "synthetic read failure" a3)
+  . testTrue "pure concatMap raises the read failure" (errContains "synthetic read failure" a4)
+  . testTrue "native map: worker failure keeps its message" (errContains "boom-at-150" b1)
+  . testTrue "native map, inflight 1: worker failure keeps its message" (errContains "boom-at-150" b2)
+  . testTrue "native fold: worker failure propagates" (errContains "boom-at-150" b3)
+  . testTrue "pure fold: worker failure propagates" (errContains "boom-at-150" b4)
+  ) s
+
+
+-- Stream files (not Rust)
+----------------------------
+
+-- The same stages over real stream files, through `@next` and `@write`.
+writeTo :: OStream Int -> [Int] -> <IO> ()
+writeTo o xs = do
+  @write 0 o xs
+  ()
+
+-- Write batches of these sizes, counting up from `start`, one sub-packet each.
+writeSizes :: OStream Int -> Int -> [Int] -> <IO> ()
+writeSizes o start sizes = ? size sizes == 0 = do
+    ()
+  : do
+    let p = uncons sizes
+    let n = (.0 p)
+    @write 0 o (range start (start + n))
+    @flush o
+    writeSizes o (start + n) (.1 p)
+
+makeSource :: Str -> [Int] -> <IO> ()
+makeSource path sizes = do
+  Ok o <- @open path :: <IO> (Try Str (OStream Int))
+  writeSizes o 0 sizes
+  @close o
+
+readAll :: Str -> <IO> [Int]
+readAll path = do
+  Ok f <- @open path :: <IO> (Try Str (IFile [Int]))
+  Ok n <- @flen f
+  let xs = .[0:n] f
+  @close f
+  xs
+
+fileMap :: ParOpts -> Str -> [Int] -> <IO> [Int]
+fileMap opts stem sizes = do
+  makeSource (stem <> "-in.dat") sizes
+  Ok s <- @open (stem <> "-in.dat") :: <IO> (Try Str (IStream Int))
+  Ok o <- @open (stem <> "-out.dat") :: <IO> (Try Str (OStream Int))
+  psmapWith opts double (@next s) (writeTo o)
+  @close o
+  @close s
+  readAll (stem <> "-out.dat")
+
+fileMapPure :: ParOpts -> Str -> [Int] -> <IO> [Int]
+fileMapPure opts stem sizes = do
+  makeSource (stem <> "-in.dat") sizes
+  Ok s <- @open (stem <> "-in.dat") :: <IO> (Try Str (IStream Int))
+  Ok o <- @open (stem <> "-out.dat") :: <IO> (Try Str (OStream Int))
+  psmapWithPure opts double (@next s) (writeTo o)
+  @close o
+  @close s
+  readAll (stem <> "-out.dat")
+
+fileSum :: ParOpts -> Str -> [Int] -> <IO> (Try Str Int)
+fileSum opts stem sizes = do
+  makeSource (stem <> "-in.dat") sizes
+  Ok s <- @open (stem <> "-in.dat") :: <IO> (Try Str (IStream Int))
+  r <- psfoldWith opts (+) 0 double (@next s)
+  @close s
+  r
+
+-- A `@save`d list is one data packet, which a stream reads as a single batch.
+savedSum :: ParOpts -> Str -> Int -> <IO> (Try Str Int)
+savedSum opts stem n = do
+  @save 0 (stem <> "-saved.dat") (range 0 n)
+  Ok s <- @open (stem <> "-saved.dat") :: <IO> (Try Str (IStream Int))
+  r <- psfoldWith opts (+) 0 double (@next s)
+  @close s
+  r
+
+fileMapTo :: Int -> Str -> [Int] -> <IO> (Try Str [Int])
+fileMapTo mode stem sizes = do
+  makeSource (stem <> "-in.dat") sizes
+  Ok f <- @open (stem <> "-in.dat") :: <IO> (Try Str (IFile [Int]))
+  r <- pickMapTo mode f (stem <> "-out.dat")
+  @close f
+  match r
+    | (Err e) = do
+        Err e
+    | (Ok _) = do
+        xs <- readAll (stem <> "-out.dat")
+        Ok xs
+
+-- 0: pfmapTo; 1: pfmapToWith at level 3; 2: pfmapToWithPure; 3: a failing f
+pickMapTo :: Int -> IFile [Int] -> Str -> <IO> (Try Str ())
+pickMapTo mode f dest
+  = ? mode == 0 = pfmapTo double f dest
+  : ? mode == 1 = pfmapToWith manyWorkers 3 double f dest
+  : ? mode == 2 = pfmapToWithPure manyWorkers 0 double f dest
+  : pfmapToWith manyWorkers 0 failAt f dest
+
+streamFiles :: Results -> <IO> Results
+streamFiles s = do
+  a1 <- fileMap defaultParOpts "parallel-test-a" ragged
+  a2 <- fileMap inflightOne "parallel-test-b" largeBatches
+  a3 <- fileMap defaultParOpts "parallel-test-c" []
+  b1 <- fileMapPure defaultParOpts "parallel-test-d" ragged
+  c1 <- fileSum manyWorkers "parallel-test-e" manyBatches
+  c2 <- savedSum manyWorkers "parallel-test-f" 3000
+  d1 <- fileMapTo 0 "parallel-test-g" ragged
+  d2 <- fileMapTo 1 "parallel-test-h" largeBatches
+  d3 <- fileMapTo 2 "parallel-test-i" ragged
+  d4 <- fileMapTo 3 "parallel-test-j" largeBatches
+  ( testEqual "native psmap, file to file" a1 (map double (elements ragged))
+  . testEqual "native psmap, inflight 1, file to file" a2 (map double (elements largeBatches))
+  . testEqual "native psmap, empty file" a3 none
+  . testEqual "pure psmap, file to file" b1 (map double (elements ragged))
+  . testEqual "native fold over a file" c1 (Ok (sum (map double (elements manyBatches))))
+  . testEqual "native fold over a saved list" c2 (Ok (sum (map double (range 0 3000))))
+  . testEqual "pfmapTo" d1 (Ok (map double (elements ragged)))
+  . testEqual "pfmapToWith, compressed output" d2 (Ok (map double (elements largeBatches)))
+  . testEqual "pfmapToWithPure" d3 (Ok (map double (elements ragged)))
+  . testTrue "pfmapTo returns a failure in f" (errContains "boom-at-150" d4)
+  ) s
+
+
+-- Suites
+----------
+
+-- Groups every backend can build. Rust cannot run a closure that captures a
+-- value, or a function value chosen at run time, on another thread (its
+-- closure values are not Sync), so `testNoClosures` leaves that group out.
+listGroups :: Test
+listGroups
+  = group "Failures carry their message" failures
+  . group "Reductions are order-stable" reductions
+  . group "Schedules agree" schedules
+  . group "Equivalence with the sequential form" equivalence
+
+streamGroups :: Results -> <IO> Results
+streamGroups s0 = do
+  s1 <- groupE "Streams deliver in input order" streamOrder s0
+  s2 <- groupE "Streams in arrival order" streamArrival s1
+  s3 <- groupE "Stream folds are order-stable" streamFolds s2
+  groupE "Stream failures" streamFailures s3
+
+testNoClosures :: <IO> Bool
+testNoClosures = do
+  s1 <- streamGroups (listGroups (0, 0))
+  s2 <- groupE "Stream files" streamFiles s1
+  finish s2
+
+test :: <IO> Bool
+test = do
+  s1 <- streamGroups (group "Closures" closures (listGroups (0, 0)))
+  s2 <- groupE "Stream files" streamFiles s1
+  finish s2
