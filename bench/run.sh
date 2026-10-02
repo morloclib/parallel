@@ -40,13 +40,17 @@ guard morloc make -o bench bench.loc > bench-build.log 2>&1 || { cat bench-build
 
 [ -s "$tsv" ] || printf 'case\tvariant\tworkers\trep\twall_s\tstage_s\tchecksum\n' > "$tsv"
 
+# Seconds since the epoch with microseconds. $EPOCHREALTIME would do, but it
+# needs bash 5 and macOS ships 3.2, where it is empty and every time reads 0.
+now_s() { python3 -c 'import time; print("%.6f" % time.time())'; }
+
 # One timed run: prints "wall stage checksum".
 run_once() {
   local start end
-  start=$EPOCHREALTIME
+  start=$(now_s)
   guard ./bench "$@" > bench.out 2> bench.err
   local rc=$?
-  end=$EPOCHREALTIME
+  end=$(now_s)
   if [ $rc -ne 0 ]; then
     echo "FAILED ($rc): ./bench $*" >&2
     tail -5 bench.err >&2
