@@ -1,5 +1,5 @@
 name: parallel
-version: 0.3.0
+version: 0.4.0
 homepage: https://github.com/morloclib/parallel
 synopsis: Parallel evaluation over lists, streams, and stream files
 description: Type definitions and language-independent tests for parallel map, filter, concatMap, and fold across lists, pull/sink stream stages, and byte-partitioned stream files.
