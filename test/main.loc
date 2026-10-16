@@ -1,4 +1,4 @@
-module parallel.test (test, testNoClosures, synthOpen, synthNext, sinkOpen, sinkPut, sinkBatches)
+module parallel.test (test, synthOpen, synthNext, sinkOpen, sinkPut, sinkBatches)
 
 import parallel
 import root
@@ -167,8 +167,8 @@ failures
       (errContains "boom-at-150" (@try (pconcatMapWith evenOpts (\x -> [failAt x]) big)))
 
 
--- Closures (not Rust)
------------------------
+-- Closures
+------------
 
 -- A mapped function may itself call a parallel combinator.
 rowSum :: [Int] -> Int
@@ -212,9 +212,6 @@ synthPull k = do
 elements :: [Int] -> [Int]
 elements sizes = range 0 (sum sizes)
 
--- One runner per mapped function rather than one taking the function as an
--- argument: Rust can only run a function on another thread when it is named
--- at the stage call, not passed in as a value (see `listGroups`).
 runConcat :: ParOpts -> [Int] -> <IO> [[Int]]
 runConcat opts sizes = do
   k <- synthOpen sizes
@@ -560,9 +557,6 @@ streamFiles s = do
 -- Suites
 ----------
 
--- Groups every backend can build. Rust cannot run a closure that captures a
--- value, or a function value chosen at run time, on another thread (its
--- closure values are not Sync), so `testNoClosures` leaves that group out.
 listGroups :: Test
 listGroups
   = group "Failures carry their message" failures
@@ -576,12 +570,6 @@ streamGroups s0 = do
   s2 <- groupE "Streams in arrival order" streamArrival s1
   s3 <- groupE "Stream folds are order-stable" streamFolds s2
   groupE "Stream failures" streamFailures s3
-
-testNoClosures :: <IO> Bool
-testNoClosures = do
-  s1 <- streamGroups (listGroups (0, 0))
-  s2 <- groupE "Stream files" streamFiles s1
-  finish s2
 
 test :: <IO> Bool
 test = do
