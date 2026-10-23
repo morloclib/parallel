@@ -11,6 +11,7 @@
 module parallel (*)
 
 import root
+import stream
 
 
 -- Scheduling
@@ -55,7 +56,8 @@ data ParOrder = InputOrder | ArrivalOrder
 --' point; override fields from it rather than building one from scratch, so a
 --' later field does not silently change your meaning.
 record ParOpts where
-  --' Concurrent workers. `Null` selects the pool's core count.
+  --' Concurrent workers. `Null` selects `MORLOC_THREADS` if it is set to a
+  --' positive count, otherwise the pool's core count.
   workers :: ?Int
 
   --' Elements per work unit. Read only under `FixedChunks`.
@@ -74,7 +76,8 @@ record ParOpts where
   --' batch at a time.
   inflight :: ?Int
 
---' Sensible defaults: every core, a shrinking schedule, input order.
+--' Sensible defaults: `MORLOC_THREADS` or every core, a shrinking schedule,
+--' input order.
 defaultParOpts :: ParOpts
 defaultParOpts =
   { workers = Null
@@ -153,10 +156,10 @@ papply fs x = pmap (\f -> f x) fs
 psconcatMapWith
   :: ParOpts
   -> (a -> [b])
-  -> <IO> (Try Str [a])
-  -> ([b] -> <IO> ())
+  -> Pull a
+  -> Sink b
   -> <IO> ()
-psconcatMapWith opts f pull sink = raiseRead (psconcatMapNative opts f (pullParts pull) sink)
+psconcatMapWith opts f pull sink = raiseRead (psconcatMapNative opts f (pullTriple pull) sink)
 
 --' Reduce a stream as results arrive, without materializing it.
 --'
@@ -173,30 +176,104 @@ psfoldWith
   -> (b -> b -> b)
   -> b
   -> (a -> b)
-  -> <IO> (Try Str [a])
+  -> Pull a
   -> <IO> (Try Str b)
-psfoldWith opts combine identity f pull = foldResult (psfoldNative opts combine identity f (pullParts pull))
+psfoldWith opts combine identity f pull = foldResult (psfoldNative opts combine identity f (pullTriple pull))
 
-psmapWith :: ParOpts -> (a -> b) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
-psmapWith opts f pull sink = raiseRead (psmapNative opts f (pullParts pull) sink)
+psmapWith :: ParOpts -> (a -> b) -> Pull a -> Sink b -> <IO> ()
+psmapWith opts f pull sink = raiseRead (psmapNative opts f (pullTriple pull) sink)
 
-psfilterWith :: ParOpts -> (a -> Bool) -> <IO> (Try Str [a]) -> ([a] -> <IO> ()) -> <IO> ()
-psfilterWith opts p pull sink = raiseRead (psfilterNative opts p (pullParts pull) sink)
+psfilterWith :: ParOpts -> (a -> Bool) -> Pull a -> Sink a -> <IO> ()
+psfilterWith opts p pull sink = raiseRead (psfilterNative opts p (pullTriple pull) sink)
 
-psmap :: (a -> b) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psmap :: (a -> b) -> Pull a -> Sink b -> <IO> ()
 psmap f = psmapWith defaultParOpts f
 
-psfilter :: (a -> Bool) -> <IO> (Try Str [a]) -> ([a] -> <IO> ()) -> <IO> ()
+psfilter :: (a -> Bool) -> Pull a -> Sink a -> <IO> ()
 psfilter p = psfilterWith defaultParOpts p
 
-psconcatMap :: (a -> [b]) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psconcatMap :: (a -> [b]) -> Pull a -> Sink b -> <IO> ()
 psconcatMap f = psconcatMapWith defaultParOpts f
 
-psfoldMapWith :: Monoid m => ParOpts -> (a -> m) -> <IO> (Try Str [a]) -> <IO> (Try Str m)
+psfoldMapWith :: Monoid m => ParOpts -> (a -> m) -> Pull a -> <IO> (Try Str m)
 psfoldMapWith opts f = psfoldWith opts (<>) mempty f
 
-psfoldMap :: Monoid m => (a -> m) -> <IO> (Try Str [a]) -> <IO> (Try Str m)
+psfoldMap :: Monoid m => (a -> m) -> Pull a -> <IO> (Try Str m)
 psfoldMap f = psfoldMapWith defaultParOpts f
+
+
+-- Reductions over streams
+---------------------------
+
+--' Reduce a stream chunk by chunk with an associative merge, in parallel
+--'
+--' The parallel form of stream's `reduce`. Each batch from the pull is cut
+--' into work units by `chunking`; workers turn units into summaries with
+--' `summarize`, and the calling thread merges them in stream order. `merge`
+--' must be associative, so the result does not depend on the worker count or
+--' the schedule; it need not commute. `summarize []` must be its identity, and
+--' `finish` turns the final summary into the result. Summaries are merged as
+--' a binary counter, so a summary that grows with its input (a table of
+--' counts) costs O(n log n) merging, not O(n^2). Reading overlaps with
+--' summarizing. A read failure is returned as `Err`; a failure in a function
+--' propagates.
+psreduceWith ::
+  ParOpts ->
+  --' summarize: one work unit to a summary
+  ([a] -> b) ->
+  --' merge: two summaries in stream order
+  (b -> b -> b) ->
+  --' finish: the final summary to the result
+  (b -> c) ->
+  Pull a ->
+  <IO> (Try Str c)
+psreduceWith opts summarize merge finish pull = psreduceHeadWith opts 0 summarize merge finish pull
+
+psreduce :: ([a] -> b) -> (b -> b -> b) -> (b -> c) -> Pull a -> <IO> (Try Str c)
+psreduce summarize merge finish pull = psreduceWith defaultParOpts summarize merge finish pull
+
+--' `psreduceWith` over the first elements of a pull
+--'
+--' No more is read than needed; the batch that crosses the limit is cut.
+psreduceHeadWith ::
+  ParOpts ->
+  --' Elements to read; 0 reads them all
+  Int ->
+  --' summarize: one work unit to a summary
+  ([a] -> b) ->
+  --' merge: two summaries in stream order
+  (b -> b -> b) ->
+  --' finish: the final summary to the result
+  (b -> c) ->
+  Pull a ->
+  <IO> (Try Str c)
+psreduceHeadWith opts n summarize merge finish pull = do
+  r <- psreduceNative opts n summarize merge (pullTriple pull)
+  ? .0 r = Ok (finish (.2 r)) : Err (.1 r)
+
+--' `psreduceWith` whose units also yield values to act on
+--'
+--' `summarize` receives the stream index of its unit's first element (0 for
+--' the first element of the pull) and returns a summary and a value; the
+--' values are handed to `act` on the calling thread in stream order, as
+--' the summaries are merged (to feed an external sorter, say).
+--' `summarize 0 []` must return the identity of `merge`; its value is not
+--' handed on.
+psreduceIndexedWith ::
+  ParOpts ->
+  --' summarize: a unit and its stream index to a summary and a value
+  (U64 -> [a] -> (b, d)) ->
+  --' merge: two summaries in stream order
+  (b -> b -> b) ->
+  --' finish: the final summary to the result
+  (b -> c) ->
+  --' act: an effect on each unit's value, in stream order
+  (d -> <IO> ()) ->
+  Pull a ->
+  <IO> (Try Str c)
+psreduceIndexedWith opts summarize merge finish act pull = do
+  r <- psreduceIndexedNative opts summarize merge act (pullTriple pull)
+  ? .0 r = Ok (finish (.2 r)) : Err (.1 r)
 
 
 -- Streams in morloc
@@ -216,8 +293,8 @@ psfoldMap f = psfoldMapWith defaultParOpts f
 psconcatMapWithPure
   :: ParOpts
   -> (a -> [b])
-  -> <IO> (Try Str [a])
-  -> ([b] -> <IO> ())
+  -> Pull a
+  -> Sink b
   -> <IO> ()
 psconcatMapWithPure opts f pull sink = do
   r <- pull
@@ -236,7 +313,7 @@ psfoldWithPure
   -> (b -> b -> b)
   -> b
   -> (a -> b)
-  -> <IO> (Try Str [a])
+  -> Pull a
   -> <IO> (Try Str b)
 psfoldWithPure opts combine identity f pull = psfoldPureLoop opts combine f pull identity
 
@@ -246,7 +323,7 @@ psfoldPureLoop
   :: ParOpts
   -> (b -> b -> b)
   -> (a -> b)
-  -> <IO> (Try Str [a])
+  -> Pull a
   -> b
   -> <IO> (Try Str b)
 psfoldPureLoop opts combine f pull acc = do
@@ -259,12 +336,12 @@ psfoldPureLoop opts combine f pull acc = do
         : psfoldPureLoop opts combine f pull (fold combine acc (pmapWith opts f xs))
 
 --' Hand a batch to a sink unless it is empty, matching the native stages.
-sinkNonEmpty :: ([b] -> <IO> ()) -> [b] -> <IO> ()
+sinkNonEmpty :: Sink b -> [b] -> <IO> ()
 sinkNonEmpty sink ys = ? size ys == 0 = do
     ()
   : sink ys
 
-psmapWithPure :: ParOpts -> (a -> b) -> <IO> (Try Str [a]) -> ([b] -> <IO> ()) -> <IO> ()
+psmapWithPure :: ParOpts -> (a -> b) -> Pull a -> Sink b -> <IO> ()
 psmapWithPure opts f pull sink = do
   r <- pull
   match r
@@ -275,7 +352,7 @@ psmapWithPure opts f pull sink = do
           sinkNonEmpty sink (pmapWith opts f xs)
           psmapWithPure opts f pull sink
 
-psfilterWithPure :: ParOpts -> (a -> Bool) -> <IO> (Try Str [a]) -> ([a] -> <IO> ()) -> <IO> ()
+psfilterWithPure :: ParOpts -> (a -> Bool) -> Pull a -> Sink a -> <IO> ()
 psfilterWithPure opts p pull sink = do
   r <- pull
   match r
@@ -286,7 +363,7 @@ psfilterWithPure opts p pull sink = do
           sinkNonEmpty sink (pfilterWith opts p xs)
           psfilterWithPure opts p pull sink
 
-psfoldMapWithPure :: Monoid m => ParOpts -> (a -> m) -> <IO> (Try Str [a]) -> <IO> (Try Str m)
+psfoldMapWithPure :: Monoid m => ParOpts -> (a -> m) -> Pull a -> <IO> (Try Str m)
 psfoldMapWithPure opts f = psfoldWithPure opts (<>) mempty f
 
 
@@ -308,21 +385,21 @@ psconcatMapNative
   :: ParOpts
   -> (a -> [b])
   -> <IO> (Bool, Str, [a])
-  -> ([b] -> <IO> ())
+  -> Sink b
   -> <IO> (Bool, Str)
 
 psmapNative
   :: ParOpts
   -> (a -> b)
   -> <IO> (Bool, Str, [a])
-  -> ([b] -> <IO> ())
+  -> Sink b
   -> <IO> (Bool, Str)
 
 psfilterNative
   :: ParOpts
   -> (a -> Bool)
   -> <IO> (Bool, Str, [a])
-  -> ([a] -> <IO> ())
+  -> Sink a
   -> <IO> (Bool, Str)
 
 psfoldNative
@@ -330,6 +407,22 @@ psfoldNative
   -> (b -> b -> b)
   -> b
   -> (a -> b)
+  -> <IO> (Bool, Str, [a])
+  -> <IO> (Bool, Str, b)
+
+psreduceNative
+  :: ParOpts
+  -> Int
+  -> ([a] -> b)
+  -> (b -> b -> b)
+  -> <IO> (Bool, Str, [a])
+  -> <IO> (Bool, Str, b)
+
+psreduceIndexedNative
+  :: ParOpts
+  -> (U64 -> [a] -> (b, d))
+  -> (b -> b -> b)
+  -> (d -> <IO> ())
   -> <IO> (Bool, Str, [a])
   -> <IO> (Bool, Str, b)
 
@@ -345,15 +438,6 @@ foldResult stage = do
   r <- stage
   ? .0 r = Ok (.2 r) : Err (.1 r)
 
---' Adapt a pull to the triple the native primitives take.
-pullParts :: <IO> (Try Str [a]) -> <IO> (Bool, Str, [a])
-pullParts pull = do
-  r <- pull
-  match r
-    | (Err e) = (False, e, [])
-    | (Ok xs) = (True, "", xs)
-
-
 -- Stream files
 ----------------
 
@@ -368,36 +452,29 @@ pullParts pull = do
 --' reading and writing rather than by the mapping.
 --'
 --' Any failure -- opening, reading, writing, or in `f` -- is returned as `Err`.
-pfmapToWith :: ParOpts -> Int -> (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
+pfmapToWith :: ParOpts -> CompressionLevel -> (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
 pfmapToWith opts level f file dest = @try (fileToFile opts level f file dest)
 
 --' The same over the morloc stream loop ('psmapWithPure'), which reads, maps
 --' and writes one sub-packet at a time.
-pfmapToWithPure :: ParOpts -> Int -> (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
+pfmapToWithPure :: ParOpts -> CompressionLevel -> (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
 pfmapToWithPure opts level f file dest = @try (fileToFilePure opts level f file dest)
 
 pfmapTo :: (a -> b) -> IFile [a] -> Str -> <IO> (Try Str ())
 pfmapTo f file dest = pfmapToWith defaultParOpts 0 f file dest
 
-fileToFile :: ParOpts -> Int -> (a -> b) -> IFile [a] -> Str -> <IO> ()
+fileToFile :: ParOpts -> CompressionLevel -> (a -> b) -> IFile [a] -> Str -> <IO> ()
 fileToFile opts level f file dest = do
   s <- @stream file
   Ok o <- @open dest
-  psmapWith opts f (@next s) (writeAt level o)
+  psmapWith opts f (@next s) (writeBatch level o)
   @close o
   @close s
 
-fileToFilePure :: ParOpts -> Int -> (a -> b) -> IFile [a] -> Str -> <IO> ()
+fileToFilePure :: ParOpts -> CompressionLevel -> (a -> b) -> IFile [a] -> Str -> <IO> ()
 fileToFilePure opts level f file dest = do
   s <- @stream file
   Ok o <- @open dest
-  psmapWithPure opts f (@next s) (writeAt level o)
+  psmapWithPure opts f (@next s) (writeBatch level o)
   @close o
   @close s
-
---' Write a batch as a sub-packet at a compression level; a write failure
---' aborts the stage.
-writeAt :: Int -> OStream b -> [b] -> <IO> ()
-writeAt level o xs = do
-  Ok _ <- @write level o xs
-  ()

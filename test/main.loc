@@ -5,6 +5,11 @@ import root
 import text (contains)
 import unittest
 
+source Py from "helpers.py" ("u64_int" as u64Int)
+
+-- A stream index as an Int
+u64Int :: U64 -> Int
+
 
 -- Inputs and options
 ----------------------
@@ -564,12 +569,97 @@ listGroups
   . group "Schedules agree" schedules
   . group "Equivalence with the sequential form" equivalence
 
+-- Reductions
+--------------
+
+appendInts :: [Int] -> [Int] -> [Int]
+appendInts a b = a <> b
+
+appendU64 :: [U64] -> [U64] -> [U64]
+appendU64 a b = a <> b
+
+same :: a -> a
+same x = x
+
+runAgg :: ParOpts -> [Int] -> <IO> (Try Str [Int])
+runAgg opts sizes = do
+  k <- synthOpen sizes
+  psreduceWith opts same appendInts same (synthPull k)
+
+runAggSum :: ParOpts -> [Int] -> <IO> (Try Str Int)
+runAggSum opts sizes = do
+  k <- synthOpen sizes
+  psreduceWith opts sum (+) double (synthPull k)
+
+runAggHead :: ParOpts -> Int -> [Int] -> <IO> (Try Str [Int])
+runAggHead opts n sizes = do
+  k <- synthOpen sizes
+  psreduceHeadWith opts n same appendInts same (synthPull k)
+
+-- Each unit's stream index as its summary and its elements as its value.
+unitStart :: U64 -> [Int] -> ([U64], [Int])
+unitStart at xs = ([at], xs)
+
+runIndexed :: ParOpts -> [Int] -> <IO> ([Int], [[Int]])
+runIndexed opts sizes = do
+  k <- synthOpen sizes
+  o <- sinkOpen
+  Ok starts <- psreduceIndexedWith opts unitStart appendU64 same (sinkPut o) (synthPull k)
+  units <- sinkBatches o
+  (map u64Int starts, units)
+
+-- The first element of every unit; a unit of the synthetic source starts at
+-- the stream index it holds.
+firsts :: [[Int]] -> [Int]
+firsts units = map (\u -> .[0] u) units
+
+-- Summaries merge in stream order whatever the schedule, the limit cuts the
+-- stream where it says, and the effect sees every unit in order.
+streamReductions :: Results -> <IO> Results
+streamReductions s = do
+  a1 <- runAgg defaultParOpts ragged
+  a2 <- runAgg oneWorker ragged
+  a3 <- runAgg fixedOpts manyBatches
+  a4 <- runAgg arrivalFine largeBatches
+  a5 <- runAgg inflightOne ragged
+  a6 <- runAgg defaultParOpts []
+  b1 <- runAggSum evenOpts largeBatches
+  c1 <- runAggHead fixedOpts 10 ragged
+  c2 <- runAggHead oneWorker 10 ragged
+  c3 <- runAggHead defaultParOpts 0 ragged
+  c4 <- runAggHead defaultParOpts 100000 ragged
+  d1 <- runIndexed fixedOpts ragged
+  d2 <- runIndexed oneWorker manyBatches
+  d3 <- runIndexed defaultParOpts largeBatches
+  k <- synthOpen failingSource
+  e1 <- psreduceWith defaultParOpts same appendInts same (synthPull k)
+  ( testEqual "merges in stream order, defaults" a1 (Ok (elements ragged))
+  . testEqual "merges in stream order, one worker" a2 (Ok (elements ragged))
+  . testEqual "merges in stream order, fixed chunks" a3 (Ok (elements manyBatches))
+  . testEqual "merges in stream order, single-element units" a4 (Ok (elements largeBatches))
+  . testEqual "merges in stream order, inflight 1" a5 (Ok (elements ragged))
+  . testEqual "an empty stream gives the empty summary" a6 (Ok [])
+  . testEqual "finish applies to the merged summary" b1 (Ok (double (sum (elements largeBatches))))
+  . testEqual "head stops after the first elements" c1 (Ok (range 0 10))
+  . testEqual "head on one worker stops after the first elements" c2 (Ok (range 0 10))
+  . testEqual "head 0 reads everything" c3 (Ok (elements ragged))
+  . testEqual "head of more than there is reads everything" c4 (Ok (elements ragged))
+  . testEqual "indexed units carry their stream index, fixed chunks" (.0 d1) (firsts (.1 d1))
+  . testEqual "indexed effect sees every unit in order, fixed chunks" (concat (.1 d1)) (elements ragged)
+  . testEqual "indexed units carry their stream index, one worker" (.0 d2) (firsts (.1 d2))
+  . testEqual "indexed effect sees every unit in order, one worker" (concat (.1 d2)) (elements manyBatches)
+  . testEqual "indexed units carry their stream index, defaults" (.0 d3) (firsts (.1 d3))
+  . testEqual "indexed effect sees every unit in order, defaults" (concat (.1 d3)) (elements largeBatches)
+  . testTrue "a read failure is an Err" (errContains "synthetic read failure" e1)
+  ) s
+
 streamGroups :: Results -> <IO> Results
 streamGroups s0 = do
   s1 <- groupE "Streams deliver in input order" streamOrder s0
   s2 <- groupE "Streams in arrival order" streamArrival s1
   s3 <- groupE "Stream folds are order-stable" streamFolds s2
-  groupE "Stream failures" streamFailures s3
+  s4 <- groupE "Stream reductions" streamReductions s3
+  groupE "Stream failures" streamFailures s4
 
 test :: <IO> Bool
 test = do
